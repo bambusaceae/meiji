@@ -468,7 +468,7 @@ function buildPane(){
   } else if (tab === 'notes'){
     const order = new Map(); let n = 0; L.outline.forEach(o => { if (o.t === 'r') [o.main, ...o.sides].forEach(c => order.set(c, n++)); });
     const xs = Object.entries(notes[L.id] || {}).filter(([cid, t]) => t && t.trim() && L.cards[cid])
-      .sort((a, b) => (tsOf(L.id, b[0]) - tsOf(L.id, a[0])) || (order.get(a[0]) - order.get(b[0])));
+      .sort((a, b) => (tsOf(L.id, b[0]) - tsOf(L.id, a[0])) || (order.get(b[0]) - order.get(a[0])));
     if (!xs.length){ pane.innerHTML = '<div class="empty">No notes in this lecture yet.<br>Type in the note field at the bottom of a card.</div>'; return; }
     const box = document.createElement('div'); box.className = 'gl'; pane.appendChild(box);
     xs.forEach(([cid, t]) => {
