@@ -156,6 +156,7 @@ body.open .scrim{opacity:1;pointer-events:auto}
 .mk:active,.o-i:active,.lec:active{background:var(--sel)}
 .mk q{quotes:"“" "”"}
 .mk small{display:block;color:var(--mute);font-size:11.5px;margin-top:1px}
+.nt-x{display:block;white-space:pre-line;display:-webkit-box;-webkit-line-clamp:4;-webkit-box-orient:vertical;overflow:hidden}
 .empty{color:var(--mute);font-size:13px;padding:12px 14px;line-height:1.7}
 .foot{border-top:.5px solid var(--sep);padding:8px 14px;display:flex;gap:8px;align-items:center;font-size:12px;color:var(--mute)}
 .foot .sp{flex:1}
@@ -227,7 +228,7 @@ body:has(.top.hide) .guide{top:env(safe-area-inset-top,0px)}
 <nav class="drawer" id="drawer" aria-label="Contents">
   <div class="dh">Lectures</div>
   <div class="gl" id="lecs"></div>
-  <div class="tabs"><button class="tab on" data-tab="toc" id="tabToc">Contents</button><button class="tab" data-tab="marks" id="tabMarks">Marks</button></div>
+  <div class="tabs"><button class="tab on" data-tab="toc" id="tabToc">Contents</button><button class="tab" data-tab="marks" id="tabMarks">Marks</button><button class="tab" data-tab="notes" id="tabNotes">Notes</button></div>
   <div class="pane" id="pane"></div>
   <div class="foot"><span id="syncNote">Saving marks…</span><span class="sp"></span><button class="btn" id="copyBtn">Copy all</button></div>
 </nav>
@@ -262,6 +263,9 @@ const plainOf = h => { const t = document.createElement('div'); t.innerHTML = h;
 let lastTick = LS.get('lastTick', null);
 let notes = LS.get('notes', {});   // {lecId: {cardId: text}}
 const noteOf = (lid, cid) => (notes[lid] && notes[lid][cid]) || '';
+let noteTs = LS.get('noteTs', {});   // {lecId: {cardId: first-written ms}}
+const tsOf = (lid, cid) => (noteTs[lid] && noteTs[lid][cid]) || 0;
+function stampNote(lid, cid){ if (tsOf(lid, cid)) return; (noteTs[lid] = noteTs[lid] || {})[cid] = Date.now(); LS.set('noteTs', noteTs); }
 let lecIdx = Math.max(0, D.lectures.findIndex(l => l.id === ((lastTick && lastTick.lec) || LS.get('lec', D.lectures[D.lectures.length-1].id))));
 let restoring = false, userActed = false;
 let marks = new Map(Object.entries(LS.get('marks', {})));
@@ -461,6 +465,18 @@ function buildPane(){
       });
     });
     highlightToc();
+  } else if (tab === 'notes'){
+    const order = new Map(); let n = 0; L.outline.forEach(o => { if (o.t === 'r') [o.main, ...o.sides].forEach(c => order.set(c, n++)); });
+    const xs = Object.entries(notes[L.id] || {}).filter(([cid, t]) => t && t.trim() && L.cards[cid])
+      .sort((a, b) => (tsOf(L.id, b[0]) - tsOf(L.id, a[0])) || (order.get(a[0]) - order.get(b[0])));
+    if (!xs.length){ pane.innerHTML = '<div class="empty">No notes in this lecture yet.<br>Type in the note field at the bottom of a card.</div>'; return; }
+    const box = document.createElement('div'); box.className = 'gl'; pane.appendChild(box);
+    xs.forEach(([cid, t]) => {
+      const b = document.createElement('button'); b.className = 'mk';
+      b.innerHTML = '<span class="nt-x"></span><small></small>'; b.querySelector('.nt-x').textContent = t; b.querySelector('small').innerHTML = L.cards[cid].h;
+      b.onclick = () => { const ri = rows.findIndex(r => r.ids.includes(cid)); if (ri < 0) return; jump(ri, rows[ri].ids.indexOf(cid), () => { const ta = cardEls.get(cid) && cardEls.get(cid).querySelector('.note'); if (ta) ta.scrollIntoView({block:'center'}); }); };
+      box.appendChild(b);
+    });
   } else {
     const list = [...marks.entries()].filter(([, m]) => m.lec === L.id);
     if (!list.length){ pane.innerHTML = '<div class="empty">No marks in this lecture yet.<br>Press and hold to select text in a card, and ' + ICON.dig + ' and ' + ICON.key + ' appear next to it. Tap an existing mark to change or delete it.</div>'; return; }
@@ -701,7 +717,7 @@ function flushNotes(){
     const i = k.indexOf('|'), lid = k.slice(0, i), cid = k.slice(i + 1), v = noteOf(lid, cid);
     if (!db) return;
     const ref = db.collection('notec').doc(cardKey(lid, cid));
-    (v.trim() ? ref.set({lec: lid, card: cid, text: v}) : ref.delete()).catch(() => toast('Note did not sync. Kept on this device for now'));
+    (v.trim() ? ref.set(Object.assign({lec: lid, card: cid, text: v}, tsOf(lid, cid) ? {ts: tsOf(lid, cid)} : {})) : ref.delete()).catch(() => toast('Note did not sync. Kept on this device for now'));
   });
 }
 document.getElementById('feed').addEventListener('input', e => {
@@ -710,6 +726,7 @@ document.getElementById('feed').addEventListener('input', e => {
   const lid = lec().id, cid = ta.closest('.card').dataset.card;
   notes[lid] = Object.assign({}, notes[lid], {[cid]: ta.value});
   LS.set('notes', notes);
+  if (ta.value.trim()) stampNote(lid, cid);
   pendingNotes[lid + '|' + cid] = true; clearTimeout(noteT); noteT = setTimeout(flushNotes, 1000);
 });
 document.getElementById('feed').addEventListener('focusout', e => { if (e.target.closest && e.target.closest('.note')) flushNotes(); });
@@ -838,12 +855,14 @@ renderLecture(true);
   }catch(e){}
   db.collection('notec').onSnapshot(snap => {
     const next = {};
-    snap.docs.forEach(d => { if (!d.exists) return; const x = d.data(); if (!x || !x.lec) return; (next[x.lec] = next[x.lec] || {})[x.card] = x.text || ''; });
+    snap.docs.forEach(d => { if (!d.exists) return; const x = d.data(); if (!x || !x.lec) return; (next[x.lec] = next[x.lec] || {})[x.card] = x.text || ''; if (x.ts && !tsOf(x.lec, x.card)){ (noteTs[x.lec] = noteTs[x.lec] || {})[x.card] = x.ts; } });
+    LS.set('noteTs', noteTs);
     Object.keys(pendingNotes).forEach(k => { const i = k.indexOf('|'), lid = k.slice(0, i), cid = k.slice(i + 1); (next[lid] = next[lid] || {})[cid] = noteOf(lid, cid); });
     const ae = document.activeElement;
     if (ae && ae.classList && ae.classList.contains('note')){ const lid = lec().id, cid = ae.closest('.card').dataset.card; (next[lid] = next[lid] || {})[cid] = ae.value; }
     notes = next; LS.set('notes', notes);
     document.querySelectorAll('.note').forEach(ta => { if (ta !== document.activeElement){ const v = noteOf(lec().id, ta.closest('.card').dataset.card); if (ta.value !== v){ ta.value = v; fitNote(ta); } } });
+    if (tab === 'notes' && (document.body.classList.contains('open') || matchMedia('(min-width:1100px)').matches)) buildPane();
   }, () => {});
   db.collection('marks').onSnapshot(snap => {
     const next = new Map(); snap.docs.forEach(d => { if (d.exists) next.set(d.id, d.data()); });
