@@ -1,4 +1,4 @@
-<!doctype html><html><head><meta charset=utf8><meta name="robots" content="noindex,nofollow,noarchive"><title>Meiji Cards</title><link rel="icon" href="icon.png"><link rel="apple-touch-icon" href="icon.png"><link rel="manifest" href="manifest.json"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="Meiji Cards"><meta name="apple-mobile-web-app-status-bar-style" content="default"><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<!doctype html><html><head><meta charset=utf8><meta name="robots" content="noindex,nofollow,noarchive"><title>Meiji Cards</title><link rel="icon" href="icon.png"><link rel="apple-touch-icon" href="icon.png"><link rel="manifest" href="manifest.json"><meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-title" content="Meiji Cards"><meta name="apple-mobile-web-app-status-bar-style" content="default"><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style><script>if("serviceWorker" in navigator)addEventListener("load",function(){navigator.serviceWorker.register("sw.js").catch(function(){})});</script></head><body>
 <style>
 /* Style follows 导论artifact: white canvas, gray filled rounded cards (darker gray = higher level), frosted glass bars and panels, hairline separators, neutral near-black accent. Q/＊ mark colors stay as functional colors. Feed = one column; each row pages sideways to its linked cards; outline in a left drawer. */
 :root{
@@ -747,11 +747,12 @@ const setSync = msg => { const n = $('#syncNote'); if (n) n.textContent = msg; }
 let ghQueue = Promise.resolve();   // one write at a time: parallel commits to one branch can 409
 
 class GhCol {
-  constructor(name){ this.name = name; this.data = {}; this.sha = null; this.etag = null; this.pending = new Map(); this.subs = new Set(); this.timer = null; this.loaded = false; }
+  constructor(name){ this.name = name; this.data = {}; this.sha = null; this.etag = null; this.pending = new Map(Object.entries(LS.get('ghp:' + name, {}))); this.subs = new Set(); this.timer = null; this.loaded = false; }
   url(){ return `https://api.github.com/repos/${GH.owner}/${GH.repo}/contents/${this.name}.json`; }
   headers(extra){ return Object.assign({Authorization: 'Bearer ' + ghTok(), Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}, extra || {}); }
   snap(){ return {docs: Object.entries(this.data).map(([id, v]) => ({id, exists: true, data: () => v}))}; }
   emit(){ if (!this.loaded) return; const s = this.snap(); this.subs.forEach(f => { try{ f.cb(s); }catch(e){} }); }
+  savePending(){ LS.set('ghp:' + this.name, Object.fromEntries(this.pending)); }   // unsynced changes survive reloads and offline use
   applyPending(){ this.pending.forEach((v, id) => { if (v === null) delete this.data[id]; else this.data[id] = v; }); }
   async pull(force){
     const h = this.headers(!force && this.etag ? {'If-None-Match': this.etag} : {});
@@ -768,12 +769,13 @@ class GhCol {
   }
   put(id, v){
     if (v === null) delete this.data[id]; else this.data[id] = v;
-    this.pending.set(id, v); this.emit();
+    this.pending.set(id, v); this.savePending(); this.emit();
     clearTimeout(this.timer); this.timer = setTimeout(() => this.schedule(), 900);
     return Promise.resolve();
   }
   schedule(){ ghQueue = ghQueue.then(() => this.flush()).catch(() => {}); }
   async flush(){
+    if (this.pending.size && !this.loaded) await this.pull(true);
     for (let attempt = 0; attempt < 4; attempt++){
       if (!this.pending.size) return;
       const sent = new Map(this.pending);
@@ -788,6 +790,7 @@ class GhCol {
         const j = await r.json();
         this.sha = j.content.sha; this.etag = null;
         sent.forEach((v, id) => { if (this.pending.get(id) === v) this.pending.delete(id); });
+        this.savePending();
         setSync('Marks synced');
         return;
       }
@@ -807,14 +810,19 @@ async function ghDb(){
   try{
     await Promise.all(Object.values(cols).map(c => c.pull(true)));
   }catch(e){
-    setSync(e && (e.status === 401 || e.status === 403) ? 'Token rejected. Tap here to change it' : 'Could not reach GitHub. Marks are stored on this device only');
-    return null;
+    if (e && (e.status === 401 || e.status === 403)){ setSync('Token rejected. Tap here to change it'); return null; }
+    setSync('Offline. Marks are kept on this device and sync when back online');
   }
   const refresh = async () => {
-    if (document.visibilityState !== 'visible') return;
-    try{ await Promise.all(Object.values(cols).map(c => c.pending.size ? null : c.pull(false))); }
+    if (document.visibilityState !== 'visible' || !navigator.onLine) return;
+    try{
+      await Promise.all(Object.values(cols).map(c => !c.loaded ? c.pull(true) : c.pending.size ? null : c.pull(false)));
+      Object.values(cols).forEach(c => { if (c.pending.size) c.schedule(); });
+    }
     catch(e){ setSync('Sync interrupted. Marks are kept on this device for now'); Object.values(cols).forEach(c => c.subs.forEach(f => { try{ f.err && f.err(e); }catch(_){} })); }
   };
+  Object.values(cols).forEach(c => { if (c.loaded && c.pending.size) c.schedule(); });   // send changes made while offline
+  addEventListener('online', refresh);
   document.addEventListener('visibilitychange', refresh);
   setInterval(refresh, 45000);
   return {
@@ -822,8 +830,8 @@ async function ghDb(){
       const c = cols[name];
       return {
         doc: id => ({ set: v => c.put(id, v), delete: () => c.put(id, null) }),
-        get: () => Promise.resolve(c.snap()),
-        onSnapshot(cb, err){ const f = {cb, err}; c.subs.add(f); try{ cb(c.snap()); }catch(e){} return () => c.subs.delete(f); }
+        get: () => c.loaded ? Promise.resolve(c.snap()) : Promise.reject(new Error('offline')),
+        onSnapshot(cb, err){ const f = {cb, err}; c.subs.add(f); if (c.loaded) try{ cb(c.snap()); }catch(e){} return () => c.subs.delete(f); }
       };
     }
   };
@@ -836,7 +844,7 @@ renderLecture(true);
 (async () => {
   try{ db = await ghDb(); }catch(e){ db = null; }
   if (!db) return;
-  $('#syncNote').textContent = 'Marks synced';
+  if (navigator.onLine && $('#syncNote').textContent.indexOf('Offline') < 0) $('#syncNote').textContent = 'Marks synced';
   const applyRead = docs => {
     readMap = new Map(); let last = null;
     docs.forEach(d => { if (!d.exists) return; const x = d.data(); if (!x || !x.lec) return; readOf(x.lec).add(x.card); if (!last || (x.ts || 0) > (last.ts || 0)) last = x; });
