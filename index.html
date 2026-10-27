@@ -163,6 +163,15 @@ body.open .scrim{opacity:1;pointer-events:auto}
 .empty{color:var(--mute);font-size:13px;padding:12px 14px;line-height:1.7}
 .foot{border-top:.5px solid var(--sep);padding:8px 14px;display:flex;gap:8px;align-items:center;font-size:12px;color:var(--mute)}
 .foot .sp{flex:1}
+/* GitHub Sync block (same layout as 导论) */
+.sy{border-top:.5px solid var(--sep);padding:10px 14px 8px}
+.syr{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:12px;color:var(--mute)}
+.sybtn{flex:none;padding:4px 12px;border-radius:8px;background:var(--accent);color:var(--bg);font-size:12px}
+.syd{margin-top:8px;font-size:12px}
+.syd summary{cursor:pointer;color:var(--ink2);padding:2px 0}
+.syd .iw{height:30px;margin:8px 0;overflow:hidden;background:var(--fill);border-radius:8px}
+.syd input{display:block;width:136.75%;height:136.75%;box-sizing:border-box;font:inherit;font-size:16px;color:var(--ink);background:none;border:0;padding:0 12px;outline:0;transform:scale(.73125);transform-origin:0 0}
+.synote{font-size:11px}
 .btn{font-size:14px;color:var(--accent);padding:6px 0}
 .toast{position:fixed;left:50%;bottom:calc(84px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);z-index:60;background:color-mix(in srgb,var(--ink) 82%,transparent);color:var(--bg);font-size:13px;padding:8px 14px;border-radius:12px;opacity:0;pointer-events:none;transition:opacity .2s}
 .toast.show{opacity:1}
@@ -236,7 +245,15 @@ body:has(.top.hide) .guide{top:env(safe-area-inset-top,0px)}
   <div class="gl" id="lecs"></div>
   <div class="tabs"><button class="tab on" data-tab="toc" id="tabToc">Contents</button><button class="tab" data-tab="marks" id="tabMarks">Marks</button><button class="tab" data-tab="notes" id="tabNotes">Notes</button></div>
   <div class="pane" id="pane"></div>
-  <div class="foot"><span id="syncNote">Saving marks…</span><span class="sp"></span><button class="btn" id="copyBtn">Copy all</button></div>
+  <div class="sy">
+    <div class="syr"><span id="syncNote">GitHub Sync is off</span><button class="sybtn" id="syncBtn">Sync</button></div>
+    <details class="syd" id="syd"><summary>GitHub Sync settings</summary>
+      <div class="iw"><input id="srepo" type="text" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="owner/repository"></div>
+      <div class="iw"><input id="stoken" type="password" autocomplete="off" placeholder="Paste your fine-grained token"></div>
+      <div class="syr"><span class="synote">Marks, notes and read state sync to this repository.</span><button class="sybtn" id="ssave">Save</button></div>
+    </details>
+  </div>
+  <div class="foot"><span class="sp"></span><button class="btn" id="copyBtn">Copy all</button></div>
 </nav>
 
 <div class="lt"><div class="sub" id="ltSub"></div><h1 id="ltT"></h1></div>
@@ -741,14 +758,11 @@ document.getElementById('feed').addEventListener('input', e => {
    meiji-data, merges it item by item (newest change wins, deletions kept as dated tombstones), and pushes
    the merged result back. Nothing local is ever replaced wholesale, so changes made offline or in a stale
    window survive and go up on the next sync. */
-const GH = {owner: 'bambusaceae', repo: 'meiji-data', file: 'data.json'};
+const GH_FILE = 'data.json';
 const ghTok = () => { try{ return localStorage.getItem('kc:ghtoken') || ''; }catch(e){ return ''; } };
-function askToken(){
-  const t = prompt('GitHub token (fine-grained, Contents read/write on meiji-data only). Leave empty to turn sync off.', ghTok());
-  if (t === null) return;
-  try{ if (t.trim()) localStorage.setItem('kc:ghtoken', t.trim()); else localStorage.removeItem('kc:ghtoken'); }catch(e){}
-  location.reload();
-}
+const ghRepo = () => { try{ return localStorage.getItem('kc:ghrepo') || ''; }catch(e){ return ''; } };
+try{ if (ghTok() && localStorage.getItem('kc:ghrepo') == null) localStorage.setItem('kc:ghrepo', 'bambusaceae/meiji-data'); }catch(e){}   // devices set up before the repository field existed
+const sOn = () => !!(ghTok() && ghRepo());
 const b64enc = s => { const b = new TextEncoder().encode(s); let bin = ''; for (let i = 0; i < b.length; i += 0x8000) bin += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000)); return btoa(bin); };
 const b64dec = s => { const bin = atob(s.replace(/\s/g, '')); return new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0))); };
 const setSync = msg => { const n = $('#syncNote'); if (n) n.textContent = msg; };
@@ -829,13 +843,13 @@ async function legacyDoc(){
   return {marks: m, markDel: {}, notes: notesR, read: readR};
 }
 function ghFetch(path, opts = {}){
-  return fetch(`https://api.github.com/repos/${GH.owner}/${GH.repo}/contents/${path}`, Object.assign({}, opts, {cache: 'no-store',
+  return fetch(`https://api.github.com/repos/${ghRepo()}/contents/${path}`, Object.assign({}, opts, {cache: 'no-store',
     headers: Object.assign({Authorization: 'Bearer ' + ghTok(), Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}, opts.body ? {'Content-Type': 'application/json'} : {}, opts.headers || {})}));
 }
 
 let firstSync = true;
 async function sync(){
-  if (!ghTok()){ setSync('Sync is off. Tap here to add a token'); return; }
+  if (!sOn()){ setSync('GitHub Sync is off'); return; }
   if (!navigator.onLine){ setSync('Offline. Changes are kept on this device and sync when back online'); return; }
   if (syncSt.busy) return;
   syncSt.busy = true; clearTimeout(syncT);
@@ -843,7 +857,7 @@ async function sync(){
   try{
     for (let attempt = 0; attempt < 3; attempt++){
       let sha = null, remoteStr = null;
-      const get = await ghFetch(GH.file);
+      const get = await ghFetch(GH_FILE);
       if (get.status === 200){
         const j = await get.json(); sha = j.sha;
         const R = JSON.parse(b64dec(j.content) || '{}');
@@ -860,7 +874,7 @@ async function sync(){
       if (bodyStr === remoteStr){ if (+LS.get('dirty', 0) <= started) LS.set('dirty', 0); break; }   // nothing new to send
       const payload = {message: 'Update ' + new Date().toISOString(), content: b64enc(JSON.stringify(body, null, 1) + '\n')};
       if (sha) payload.sha = sha;
-      const put = await ghFetch(GH.file, {method: 'PUT', body: JSON.stringify(payload)});
+      const put = await ghFetch(GH_FILE, {method: 'PUT', body: JSON.stringify(payload)});
       if (put.ok){ LS.set('synced', Date.now()); if (+LS.get('dirty', 0) <= started) LS.set('dirty', 0); break; }
       if (put.status === 409 || put.status === 422) continue;        // changed elsewhere meanwhile: pull and merge again
       if (put.status === 401 || put.status === 403 || put.status === 404){ const e = new Error('auth'); e.auth = true; throw e; }
@@ -870,7 +884,7 @@ async function sync(){
     setSync(+LS.get('dirty', 0) ? 'Changes waiting to sync' : 'Synced');
   }catch(e){
     syncSt.error = (e && e.message) || 'network error';
-    setSync(e && e.auth ? 'Token rejected. Tap here to change it' : (navigator.onLine ? 'Sync failed. Changes are kept on this device for now' : 'Offline. Changes are kept on this device and sync when back online'));
+    setSync(e && e.auth ? 'Check the repository and token in GitHub Sync settings' : (navigator.onLine ? 'Sync failed. Changes are kept on this device for now' : 'Offline. Changes are kept on this device and sync when back online'));
   }
   syncSt.busy = false;
   if (!syncSt.error && +LS.get('dirty', 0) > started) sync();      // something changed while this sync ran
@@ -884,15 +898,25 @@ function jumpToLastRead(R){
   const li = D.lectures.findIndex(l => l.id === last.lec);
   if (li >= 0 && li !== lecIdx){ lecIdx = li; renderLecture(true); } else restorePos();
 }
-document.getElementById('syncNote').addEventListener('click', askToken);
-document.getElementById('syncNote').style.cursor = 'pointer';
+function setupSyncForm(){
+  $('#srepo').value = ghRepo();
+  $('#stoken').value = ''; $('#stoken').placeholder = ghTok() ? 'Saved · paste to replace' : 'Paste your fine-grained token';
+  $('#syd').open = !sOn();
+}
+$('#ssave').addEventListener('click', () => {
+  const t = $('#stoken').value.trim();
+  try{ if (t) localStorage.setItem('kc:ghtoken', t); localStorage.setItem('kc:ghrepo', $('#srepo').value.trim()); }catch(e){}
+  setupSyncForm(); LS.set('dirty', Date.now()); firstSync = true; sync();
+});
+$('#syncBtn').addEventListener('click', () => sync());
+setupSyncForm();
 addEventListener('online', () => sync());
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') sync(); else if (+LS.get('dirty', 0)) sync(); });
 setInterval(() => { if (document.visibilityState === 'visible') sync(); }, 45000);
 
 /* ---------- boot ---------- */
 renderLecture(true);
-if (!ghTok()) setSync('Sync is off. Tap here to add a token');
+if (!sOn()) setSync('GitHub Sync is off');
 else { setSync(+LS.get('dirty', 0) ? 'Changes waiting to sync' : 'Syncing…'); sync(); }
 })();
 </script>
