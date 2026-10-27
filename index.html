@@ -272,7 +272,6 @@ let marks = new Map(Object.entries(LS.get('marks', {})));
 let readMap = new Map(Object.entries(LS.get('read', {})).map(([k, v]) => [k, new Set(v)]));
 const readOf = lid => { if (!readMap.has(lid)) readMap.set(lid, new Set()); return readMap.get(lid); };
 const isRead = (lid, cid) => readMap.has(lid) && readMap.get(lid).has(cid);
-let db = null;
 let tab = 'toc';
 let curRow = 0;
 let rows = [];        // [{el, o, cards:[cid], pager, chips, group}]
@@ -622,10 +621,8 @@ function disarm(){ document.querySelectorAll('.card.armed').forEach(c => c.class
 function saveRead(lid, changed){
   LS.set('read', Object.fromEntries([...readMap].map(([k, v]) => [k, [...v]])));
   const plan = changed.map(cid => [cid, readOf(lid).has(cid)]);   // decide first: snapshots may land between writes
-  if (db) plan.forEach(([cid, on], i) => {
-    const ref = db.collection('readc').doc(cardKey(lid, cid));
-    (on ? ref.set({lec: lid, card: cid, ts: Date.now() + i}) : ref.delete()).catch(() => toast('Read state did not sync'));
-  });
+  plan.forEach(([cid, on], i) => { readU[nk(lid, cid)] = {on: on ? 1 : 0, t: Date.now() + i}; });
+  LS.set('readU', readU); markDirty();
   if (document.body.classList.contains('open') || matchMedia('(min-width:1100px)').matches) buildPane();
 }
 function toggleRowRead(r){
@@ -682,9 +679,6 @@ bar.querySelectorAll('.bb').forEach(b => {
 function refreshSide(){ buildLecs(); if (document.body.classList.contains('open') || matchMedia('(min-width:1100px)').matches) buildPane(); else { const t = countsFor(lec().id); $('#tabMarks').textContent = 'Marks' + (t.dig + t.key ? ` ${t.dig + t.key}` : ''); } }
 
 /* ---------- persistence ---------- */
-function cacheLocal(){ LS.set('marks', Object.fromEntries(marks)); }
-function persistSet(id, m){ cacheLocal(); if (db) db.collection('marks').doc(id).set(m).catch(err => toast(err && err.code === 'quota_exceeded' ? 'Mark limit reached. Delete some and try again' : 'This mark did not sync. It is kept on this device for now')); }
-function persistDel(id){ cacheLocal(); if (db) db.collection('marks').doc(id).delete().catch(() => toast('Delete did not sync. Please try again')); }
 let toastT = null;
 function toast(msg, isHtml){ const t = $('#toast'); if (isHtml) t.innerHTML = msg; else t.textContent = msg; t.classList.add('show'); clearTimeout(toastT); toastT = setTimeout(() => t.classList.remove('show'), 1600); }
 
@@ -709,17 +703,6 @@ $('#copyBtn').onclick = () => {
 
 /* ---------- notes ---------- */
 function fitNote(ta){ ta.style.height = '31px'; const h = Math.max(31, ta.scrollHeight); ta.style.height = h + 'px'; ta.parentNode.style.height = (h * .875) + 'px'; }
-const pendingNotes = {}; let noteT = null;   // key "lid|cid" -> true
-function flushNotes(){
-  clearTimeout(noteT);
-  Object.keys(pendingNotes).forEach(k => {
-    delete pendingNotes[k];
-    const i = k.indexOf('|'), lid = k.slice(0, i), cid = k.slice(i + 1), v = noteOf(lid, cid);
-    if (!db) return;
-    const ref = db.collection('notec').doc(cardKey(lid, cid));
-    (v.trim() ? ref.set(Object.assign({lec: lid, card: cid, text: v}, tsOf(lid, cid) ? {ts: tsOf(lid, cid)} : {})) : ref.delete()).catch(() => toast('Note did not sync. Kept on this device for now'));
-  });
-}
 document.getElementById('feed').addEventListener('input', e => {
   const ta = e.target.closest('.note'); if (!ta) return;
   fitNote(ta);
@@ -727,13 +710,15 @@ document.getElementById('feed').addEventListener('input', e => {
   notes[lid] = Object.assign({}, notes[lid], {[cid]: ta.value});
   LS.set('notes', notes);
   if (ta.value.trim()) stampNote(lid, cid);
-  pendingNotes[lid + '|' + cid] = true; clearTimeout(noteT); noteT = setTimeout(flushNotes, 1000);
+  noteU[nk(lid, cid)] = Date.now(); LS.set('noteU', noteU); markDirty();
 });
-document.getElementById('feed').addEventListener('focusout', e => { if (e.target.closest && e.target.closest('.note')) flushNotes(); });
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushNotes(); });
 
-/* ---------- GitHub-backed store (replaces the artifact db) ---------- */
-const GH = {owner: 'bambusaceae', repo: 'meiji-data'};
+/* ---------- GitHub Sync ----------
+   Same model as 导论: everything lives on this device first (localStorage); a sync pulls data.json from
+   meiji-data, merges it item by item (newest change wins, deletions kept as dated tombstones), and pushes
+   the merged result back. Nothing local is ever replaced wholesale, so changes made offline or in a stale
+   window survive and go up on the next sync. */
+const GH = {owner: 'bambusaceae', repo: 'meiji-data', file: 'data.json'};
 const ghTok = () => { try{ return localStorage.getItem('kc:ghtoken') || ''; }catch(e){ return ''; } };
 function askToken(){
   const t = prompt('GitHub token (fine-grained, Contents read/write on meiji-data only). Leave empty to turn sync off.', ghTok());
@@ -744,144 +729,148 @@ function askToken(){
 const b64enc = s => { const b = new TextEncoder().encode(s); let bin = ''; for (let i = 0; i < b.length; i += 0x8000) bin += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000)); return btoa(bin); };
 const b64dec = s => { const bin = atob(s.replace(/\s/g, '')); return new TextDecoder().decode(Uint8Array.from(bin, c => c.charCodeAt(0))); };
 const setSync = msg => { const n = $('#syncNote'); if (n) n.textContent = msg; };
-let ghQueue = Promise.resolve();   // one write at a time: parallel commits to one branch can 409
+const nk = (lid, cid) => lid + '|' + cid;
+const splitKey = k => { const i = k.indexOf('|'); return [k.slice(0, i), k.slice(i + 1)]; };
+const sortObj = o => Object.fromEntries(Object.keys(o).sort().map(k => [k, o[k]]));
 
-class GhCol {
-  constructor(name){ this.name = name; this.data = {}; this.sha = null; this.etag = null; this.pending = new Map(Object.entries(LS.get('ghp:' + name, {}))); this.subs = new Set(); this.timer = null; this.loaded = false; }
-  url(){ return `https://api.github.com/repos/${GH.owner}/${GH.repo}/contents/${this.name}.json`; }
-  headers(extra){ return Object.assign({Authorization: 'Bearer ' + ghTok(), Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}, extra || {}); }
-  snap(){ return {docs: Object.entries(this.data).map(([id, v]) => ({id, exists: true, data: () => v}))}; }
-  emit(){ if (!this.loaded) return; const s = this.snap(); this.subs.forEach(f => { try{ f.cb(s); }catch(e){} }); }
-  savePending(){ LS.set('ghp:' + this.name, Object.fromEntries(this.pending)); }   // unsynced changes survive reloads and offline use
-  applyPending(){ this.pending.forEach((v, id) => { if (v === null) delete this.data[id]; else this.data[id] = v; }); }
-  async pull(force){
-    const h = this.headers(!force && this.etag ? {'If-None-Match': this.etag} : {});
-    const r = await fetch(this.url(), {headers: h, cache: 'no-store'});
-    if (r.status === 304) return false;
-    if (r.status === 404){ this.data = {}; this.sha = null; this.etag = null; this.applyPending(); this.loaded = true; this.emit(); return true; }
-    if (!r.ok){ const e = new Error('GitHub ' + r.status); e.status = r.status; throw e; }
-    const j = await r.json();
-    this.sha = j.sha; this.etag = r.headers.get('ETag');
-    let remote = {};
-    try{ remote = JSON.parse(b64dec(j.content) || '{}'); }catch(e){ remote = {}; }
-    this.data = remote; this.applyPending(); this.loaded = true; this.emit();
-    return true;
-  }
-  put(id, v){
-    if (v === null) delete this.data[id]; else this.data[id] = v;
-    this.pending.set(id, v); this.savePending(); this.emit();
-    clearTimeout(this.timer); this.timer = setTimeout(() => this.schedule(), 900);
-    return Promise.resolve();
-  }
-  schedule(){ ghQueue = ghQueue.then(() => this.flush()).catch(() => {}); }
-  async flush(){
-    if (this.pending.size && !this.loaded) await this.pull(true);
-    for (let attempt = 0; attempt < 4; attempt++){
-      if (!this.pending.size) return;
-      const sent = new Map(this.pending);
-      if (attempt > 0) await this.pull(true);
-      const body = {};
-      Object.keys(this.data).sort().forEach(k => { body[k] = this.data[k]; });
-      sent.forEach((v, id) => { if (v === null) delete body[id]; else body[id] = v; });
-      const payload = {message: 'Update ' + this.name, content: b64enc(JSON.stringify(body, null, 1) + '\n')};
-      if (this.sha) payload.sha = this.sha;
-      const r = await fetch(this.url(), {method: 'PUT', headers: this.headers({'Content-Type': 'application/json'}), body: JSON.stringify(payload), cache: 'no-store'});
-      if (r.ok){
-        const j = await r.json();
-        this.sha = j.content.sha; this.etag = null;
-        sent.forEach((v, id) => { if (this.pending.get(id) === v) this.pending.delete(id); });
-        this.savePending();
-        setSync('Marks synced');
-        return;
-      }
-      if (r.status === 409 || r.status === 422) continue;   // stale sha: pull and retry
-      setSync('Sync failed (' + r.status + '). Kept on this device for now');
-      if (r.status === 401 || r.status === 403) toast('Token rejected. Tap the status text to change it');
-      return;
-    }
-    setSync('Sync conflict. Kept on this device for now');
-  }
+// local change bookkeeping
+let markDel = LS.get('markDel', {});    // {markId: deleted-at ms}
+let noteU = LS.get('noteU', {});        // {"lec|card": last-edited ms}
+let readU = LS.get('readU', {});        // {"lec|card": {on, t}}
+const syncSt = {busy: false, error: '', etag: null};
+let syncT = null;
+function markDirty(){ LS.set('dirty', Date.now()); clearTimeout(syncT); syncT = setTimeout(sync, 1500); }
+
+function cacheLocal(){ LS.set('marks', Object.fromEntries(marks)); }
+function persistSet(id, m){ m.u = Date.now(); delete markDel[id]; cacheLocal(); LS.set('markDel', markDel); markDirty(); }
+function persistDel(id){ markDel[id] = Date.now(); cacheLocal(); LS.set('markDel', markDel); markDirty(); }
+
+function localDoc(){
+  const ms = {}; marks.forEach((m, id) => { ms[id] = sortObj(m); });
+  const ns = {};
+  Object.entries(notes).forEach(([lid, o]) => Object.entries(o).forEach(([cid, text]) => {
+    const k = nk(lid, cid); if (!text && !noteU[k]) return;
+    ns[k] = sortObj(Object.assign({lec: lid, card: cid, text: text || '', u: noteU[k] || 0}, tsOf(lid, cid) ? {ts: tsOf(lid, cid)} : {}));
+  }));
+  Object.keys(noteU).forEach(k => { if (!ns[k]){ const [lid, cid] = splitKey(k); ns[k] = {card: cid, lec: lid, text: '', u: noteU[k]}; } });
+  const rs = {};
+  readMap.forEach((set, lid) => set.forEach(cid => { const k = nk(lid, cid); rs[k] = {card: cid, lec: lid, on: 1, t: (readU[k] && readU[k].t) || 0}; }));
+  Object.entries(readU).forEach(([k, v]) => { if (!rs[k] && !v.on){ const [lid, cid] = splitKey(k); rs[k] = {card: cid, lec: lid, on: 0, t: v.t}; } });
+  return {version: 2, marks: sortObj(ms), markDel: sortObj(markDel), notes: sortObj(ns), read: sortObj(rs)};
 }
 
-async function ghDb(){
-  if (!ghTok()){ setSync('Sync is off. Tap here to add a token'); return null; }
-  const cols = {};
-  ['marks', 'notec', 'readc'].forEach(n => { cols[n] = new GhCol(n); });
+// merge a remote doc into local state; newest change wins per item
+function mergeRemote(R){
+  const rm = R.marks || {}, rd = R.markDel || {};
+  new Set([...marks.keys(), ...Object.keys(markDel), ...Object.keys(rm), ...Object.keys(rd)]).forEach(id => {
+    const lm = marks.get(id), lt = lm ? (lm.u || lm.ts || 0) : -1, ldt = markDel[id] || -1;
+    const r = rm[id], rt = r ? (r.u || r.ts || 0) : -1, rdt = rd[id] || -1;
+    const best = Math.max(lt, ldt, rt, rdt);
+    if (best === lt && lm) { delete markDel[id]; return; }          // local mark is newest (ties keep the mark)
+    if (best === rt && r) { marks.set(id, Object.assign({}, r)); delete markDel[id]; return; }
+    marks.delete(id); markDel[id] = best;                             // a deletion is newest
+  });
+  Object.entries(R.notes || {}).forEach(([k, r]) => {
+    const lu = noteU[k] || 0, [lid, cid] = splitKey(k), lv = noteOf(lid, cid);
+    if ((r.u || 0) > lu || (!lu && !(r.u || 0) && !lv && r.text)){
+      if (r.text) (notes[lid] = notes[lid] || {})[cid] = r.text; else if (notes[lid]) delete notes[lid][cid];
+      if (r.u) noteU[k] = r.u;
+    }
+    if (r.ts && r.text && !tsOf(lid, cid)) (noteTs[lid] = noteTs[lid] || {})[cid] = r.ts;
+  });
+  Object.entries(R.read || {}).forEach(([k, r]) => {
+    const [lid, cid] = splitKey(k), lt = (readU[k] && readU[k].t) || 0, lon = isRead(lid, cid);
+    let on = lon;
+    if ((r.t || 0) > lt){ on = !!r.on; readU[k] = {on: r.on ? 1 : 0, t: r.t}; }
+    else if ((r.t || 0) === lt) on = lon || !!r.on;
+    if (on) readOf(lid).add(cid); else if (readMap.has(lid)) readMap.get(lid).delete(cid);
+  });
+  cacheLocal(); LS.set('markDel', markDel); LS.set('notes', notes); LS.set('noteU', noteU); LS.set('noteTs', noteTs);
+  LS.set('readU', readU); LS.set('read', Object.fromEntries([...readMap].map(([k, v]) => [k, [...v]])));
+  repaint();
+}
+function repaint(){
+  applyAllMarks();
+  document.querySelectorAll('.note').forEach(ta => { if (ta !== document.activeElement){ const v = noteOf(lec().id, ta.closest('.card').dataset.card); if (ta.value !== v){ ta.value = v; fitNote(ta); } } });
+  cardEls.forEach((el, cid) => el.classList.toggle('read', isRead(lec().id, cid))); rows.forEach(updateRow);
+  refreshSide();
+}
+
+// the three per-collection files the previous version used; read once to seed data.json
+async function legacyDoc(){
+  const get = async n => { const r = await ghFetch(n + '.json'); if (r.status === 404) return {}; if (!r.ok) throw new Error('GitHub error ' + r.status); return JSON.parse(b64dec((await r.json()).content) || '{}'); };
+  const [m, n, r] = await Promise.all([get('marks'), get('notec'), get('readc')]);
+  const notesR = {}, readR = {};
+  Object.values(n).forEach(x => { if (x && x.lec) notesR[nk(x.lec, x.card)] = {lec: x.lec, card: x.card, text: x.text || '', u: 0, ts: x.ts}; });
+  Object.values(r).forEach(x => { if (x && x.lec) readR[nk(x.lec, x.card)] = {lec: x.lec, card: x.card, on: 1, t: 0, ts: x.ts}; });
+  return {marks: m, markDel: {}, notes: notesR, read: readR};
+}
+function ghFetch(path, opts = {}){
+  return fetch(`https://api.github.com/repos/${GH.owner}/${GH.repo}/contents/${path}`, Object.assign({}, opts, {cache: 'no-store',
+    headers: Object.assign({Authorization: 'Bearer ' + ghTok(), Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28'}, opts.body ? {'Content-Type': 'application/json'} : {}, opts.headers || {})}));
+}
+
+let firstSync = true;
+async function sync(){
+  if (!ghTok()){ setSync('Sync is off. Tap here to add a token'); return; }
+  if (!navigator.onLine){ setSync('Offline. Changes are kept on this device and sync when back online'); return; }
+  if (syncSt.busy) return;
+  syncSt.busy = true; clearTimeout(syncT);
+  const started = Date.now();
   try{
-    await Promise.all(Object.values(cols).map(c => c.pull(true)));
+    for (let attempt = 0; attempt < 3; attempt++){
+      let sha = null, remoteStr = null;
+      const get = await ghFetch(GH.file);
+      if (get.status === 200){
+        const j = await get.json(); sha = j.sha;
+        const R = JSON.parse(b64dec(j.content) || '{}');
+        remoteStr = JSON.stringify(R);
+        mergeRemote(R);
+        if (firstSync) jumpToLastRead(R);
+      } else if (get.status === 404){
+        const R = await legacyDoc(); mergeRemote(R);
+        if (firstSync) jumpToLastRead(R);
+      } else if (get.status === 401 || get.status === 403){ const e = new Error('auth'); e.auth = true; throw e; }
+      else throw new Error('GitHub error ' + get.status);
+      firstSync = false;
+      const body = localDoc(), bodyStr = JSON.stringify(body);
+      if (bodyStr === remoteStr){ if (+LS.get('dirty', 0) <= started) LS.set('dirty', 0); break; }   // nothing new to send
+      const payload = {message: 'Update ' + new Date().toISOString(), content: b64enc(JSON.stringify(body, null, 1) + '\n')};
+      if (sha) payload.sha = sha;
+      const put = await ghFetch(GH.file, {method: 'PUT', body: JSON.stringify(payload)});
+      if (put.ok){ LS.set('synced', Date.now()); if (+LS.get('dirty', 0) <= started) LS.set('dirty', 0); break; }
+      if (put.status === 409 || put.status === 422) continue;        // changed elsewhere meanwhile: pull and merge again
+      if (put.status === 401 || put.status === 403 || put.status === 404){ const e = new Error('auth'); e.auth = true; throw e; }
+      throw new Error('GitHub error ' + put.status);
+    }
+    syncSt.error = '';
+    setSync(+LS.get('dirty', 0) ? 'Changes waiting to sync' : 'Synced');
   }catch(e){
-    if (e && (e.status === 401 || e.status === 403)){ setSync('Token rejected. Tap here to change it'); return null; }
-    setSync('Offline. Marks are kept on this device and sync when back online');
+    syncSt.error = (e && e.message) || 'network error';
+    setSync(e && e.auth ? 'Token rejected. Tap here to change it' : (navigator.onLine ? 'Sync failed. Changes are kept on this device for now' : 'Offline. Changes are kept on this device and sync when back online'));
   }
-  const refresh = async () => {
-    if (document.visibilityState !== 'visible' || !navigator.onLine) return;
-    try{
-      await Promise.all(Object.values(cols).map(c => !c.loaded ? c.pull(true) : c.pending.size ? null : c.pull(false)));
-      Object.values(cols).forEach(c => { if (c.pending.size) c.schedule(); });
-    }
-    catch(e){ setSync('Sync interrupted. Marks are kept on this device for now'); Object.values(cols).forEach(c => c.subs.forEach(f => { try{ f.err && f.err(e); }catch(_){} })); }
-  };
-  Object.values(cols).forEach(c => { if (c.loaded && c.pending.size) c.schedule(); });   // send changes made while offline
-  addEventListener('online', refresh);
-  document.addEventListener('visibilitychange', refresh);
-  setInterval(refresh, 45000);
-  return {
-    collection(name){
-      const c = cols[name];
-      return {
-        doc: id => ({ set: v => c.put(id, v), delete: () => c.put(id, null) }),
-        get: () => c.loaded ? Promise.resolve(c.snap()) : Promise.reject(new Error('offline')),
-        onSnapshot(cb, err){ const f = {cb, err}; c.subs.add(f); if (c.loaded) try{ cb(c.snap()); }catch(e){} return () => c.subs.delete(f); }
-      };
-    }
-  };
+  syncSt.busy = false;
+  if (!syncSt.error && +LS.get('dirty', 0) > started) sync();      // something changed while this sync ran
+}
+function jumpToLastRead(R){
+  if (userActed) return;
+  let last = null;
+  Object.values(R.read || {}).forEach(x => { if (x && x.on && (!last || (x.t || x.ts || 0) > (last.t || last.ts || 0))) last = x; });
+  if (!last) return;
+  lastTick = {lec: last.lec, card: last.card}; LS.set('lastTick', lastTick);
+  const li = D.lectures.findIndex(l => l.id === last.lec);
+  if (li >= 0 && li !== lecIdx){ lecIdx = li; renderLecture(true); } else restorePos();
 }
 document.getElementById('syncNote').addEventListener('click', askToken);
 document.getElementById('syncNote').style.cursor = 'pointer';
+addEventListener('online', () => sync());
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') sync(); else if (+LS.get('dirty', 0)) sync(); });
+setInterval(() => { if (document.visibilityState === 'visible') sync(); }, 45000);
 
 /* ---------- boot ---------- */
 renderLecture(true);
-(async () => {
-  try{ db = await ghDb(); }catch(e){ db = null; }
-  if (!db) return;
-  if (navigator.onLine && $('#syncNote').textContent.indexOf('Offline') < 0) $('#syncNote').textContent = 'Marks synced';
-  const applyRead = docs => {
-    readMap = new Map(); let last = null;
-    docs.forEach(d => { if (!d.exists) return; const x = d.data(); if (!x || !x.lec) return; readOf(x.lec).add(x.card); if (!last || (x.ts || 0) > (last.ts || 0)) last = x; });
-    LS.set('read', Object.fromEntries([...readMap].map(([k, v]) => [k, [...v]])));
-    cardEls.forEach((el, cid) => el.classList.toggle('read', isRead(lec().id, cid))); rows.forEach(updateRow);
-    return last;
-  };
-  try{
-    const rs = await db.collection('readc').get();
-    const last = applyRead(rs.docs);
-    if (last && !userActed){
-      lastTick = {lec: last.lec, card: last.card}; LS.set('lastTick', lastTick);
-      const li = D.lectures.findIndex(l => l.id === last.lec);
-      if (li >= 0 && li !== lecIdx){ lecIdx = li; renderLecture(true); } else restorePos();
-    }
-  }catch(e){}
-  db.collection('notec').onSnapshot(snap => {
-    const next = {};
-    snap.docs.forEach(d => { if (!d.exists) return; const x = d.data(); if (!x || !x.lec) return; (next[x.lec] = next[x.lec] || {})[x.card] = x.text || ''; if (x.ts && !tsOf(x.lec, x.card)){ (noteTs[x.lec] = noteTs[x.lec] || {})[x.card] = x.ts; } });
-    LS.set('noteTs', noteTs);
-    Object.keys(pendingNotes).forEach(k => { const i = k.indexOf('|'), lid = k.slice(0, i), cid = k.slice(i + 1); (next[lid] = next[lid] || {})[cid] = noteOf(lid, cid); });
-    const ae = document.activeElement;
-    if (ae && ae.classList && ae.classList.contains('note')){ const lid = lec().id, cid = ae.closest('.card').dataset.card; (next[lid] = next[lid] || {})[cid] = ae.value; }
-    notes = next; LS.set('notes', notes);
-    document.querySelectorAll('.note').forEach(ta => { if (ta !== document.activeElement){ const v = noteOf(lec().id, ta.closest('.card').dataset.card); if (ta.value !== v){ ta.value = v; fitNote(ta); } } });
-    if (tab === 'notes' && (document.body.classList.contains('open') || matchMedia('(min-width:1100px)').matches)) buildPane();
-  }, () => {});
-  db.collection('marks').onSnapshot(snap => {
-    const next = new Map(); snap.docs.forEach(d => { if (d.exists) next.set(d.id, d.data()); });
-    marks = new Map([...next].map(([k, v]) => [k, Object.assign({}, v)]));
-    cacheLocal(); applyAllMarks(); refreshSide();
-  }, () => { $('#syncNote').textContent = 'Sync interrupted. Marks are kept on this device for now'; });
-  db.collection('readc').onSnapshot(snap => {
-    applyRead(snap.docs);
-    if (document.body.classList.contains('open') || matchMedia('(min-width:1100px)').matches) buildPane();
-  }, () => {});
-})();
+if (!ghTok()) setSync('Sync is off. Tap here to add a token');
+else { setSync(+LS.get('dirty', 0) ? 'Changes waiting to sync' : 'Syncing…'); sync(); }
 })();
 </script>
 
