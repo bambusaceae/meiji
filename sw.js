@@ -33,7 +33,7 @@ self.addEventListener('fetch', e => {
     e.respondWith(new Promise(resolve => {
       let done = false;
       const fallback = () => caches.match(PAGE).then(r => r || caches.match(req, { ignoreSearch: true }));
-      const net = fetch(req).then(savePage);
+      const net = fetch(new Request(req.url, { cache: 'no-cache' })).then(savePage);   // always revalidate, so a new version shows up right after it is published
       const timer = setTimeout(() => fallback().then(r => { if (r && !done) { done = true; resolve(r); } }), 4000);
       net.then(r => { if (!done) { done = true; clearTimeout(timer); resolve(r); } })
         .catch(() => fallback().then(r => { if (!done) { done = true; clearTimeout(timer); resolve(r || Response.error()); } }));
